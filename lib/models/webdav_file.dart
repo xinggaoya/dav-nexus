@@ -100,21 +100,51 @@ class WebDavFile {
 
   /// 获取父目录路径
   String get parentPath {
-    if (path == '/' || path == '/dav' || path == '/dav/') return path;
+    print('计算parentPath开始 - path: $path, isDirectory: $isDirectory'); // 调试日志
 
-    final segments = path.split('/').where((s) => s.isNotEmpty).toList();
-    if (segments.length <= 1) return '/';
+    // 基本路径检查
+    if (path == '/' || path == '/dav' || path == '/dav/') {
+      return path;
+    }
 
-    // 移除最后一个段（文件名或目录名）
-    segments.removeLast();
+    // 处理路径末尾的斜杠 - 如果是目录且不以斜杠结尾，添加斜杠
+    String normalizedPath = path;
+    if (isDirectory && !normalizedPath.endsWith('/')) {
+      normalizedPath = '$normalizedPath/';
+    }
+
+    // 获取路径分段
+    final segments = normalizedPath
+        .split('/')
+        .where((s) => s.isNotEmpty)
+        .toList();
+
+    print('路径分段: $segments'); // 调试日志
 
     if (segments.isEmpty) {
       return '/';
     }
 
+    if (segments.length <= 1) {
+      // 只有一个分段，说明在根目录下
+      if (path.startsWith('/dav')) {
+        return '/dav/';
+      }
+      return '/';
+    }
+
+    // 移除最后一个段（文件名或目录名）
+    segments.removeLast();
+
     // 重新构建路径
-    final result = '/${segments.join('/')}/';
-    print('parentPath calculation: $path -> $result'); // 调试日志
+    String result;
+    if (path.startsWith('/dav/')) {
+      result = '/dav/${segments.join('/')}/';
+    } else {
+      result = '/${segments.join('/')}/';
+    }
+
+    print('计算结果 - parentPath: $result'); // 调试日志
     return result;
   }
 

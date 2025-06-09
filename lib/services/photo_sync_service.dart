@@ -37,6 +37,11 @@ class PhotoSyncService extends ChangeNotifier {
   PhotoSyncRecord? _currentUploading;
   AppSettingsProvider? _appSettings;
 
+  // 添加已处理资源的记录，用于识别动态照片关联的资源
+  final Set<String> _processedAssetIds = {};
+  // 记录动态照片的关联ID
+  final Map<String, List<String>> _livePhotoGroups = {};
+
   // Getters
   bool get isScanning => false; // 不再有扫描阶段
   bool get isSyncing => _isProcessing; // 兼容原有接口
@@ -222,16 +227,179 @@ class PhotoSyncService extends ChangeNotifier {
       onlyAll: false,
     );
 
-    int totalCount = 0;
+    // 使用Set收集所有不重复的资源ID
+    final Set<String> uniqueAssetIds = {};
+
+    // 收集具有相同文件名的资源
+    final Map<String, List<AssetEntity>> assetsByName = {};
+
     for (final album in albums) {
-      final count = await album.assetCountAsync;
-      totalCount += count;
+      const pageSize = 100;
+      int page = 0;
+
+      while (true) {
+        final assets = await album.getAssetListPaged(
+          page: page,
+          size: pageSize,
+        );
+
+        if (assets.isEmpty) break;
+
+        for (final asset in assets) {
+          uniqueAssetIds.add(asset.id);
+
+          // 按文件名分组
+          final fileName = asset.title ?? '';
+          if (fileName.isNotEmpty) {
+            final baseName = path.basenameWithoutExtension(fileName);
+            if (!assetsByName.containsKey(baseName)) {
+              assetsByName[baseName] = [];
+            }
+            assetsByName[baseName]!.add(asset);
+          }
+        }
+
+        page++;
+        if (assets.length < pageSize) break;
+      }
 
       // 短暂暂停，让UI响应
       await Future.delayed(const Duration(milliseconds: 10));
     }
 
-    return totalCount;
+    // 分析找到具有相同文件名但不同类型的资源（可能是动态照片）
+    int duplicatesCount = 0;
+    for (final entry in assetsByName.entries) {
+      final assets = entry.value;
+      if (assets.length > 1) {
+        // 检查是否包含图片和视频组合
+        bool hasImage = assets.any((a) => a.type == AssetType.image);
+        bool hasVideo = assets.any((a) => a.type == AssetType.video);
+
+        if (hasImage && hasVideo) {
+          // 减去重复数量 (减去视频数量，只保留图片)
+          duplicatesCount += assets
+              .where((a) => a.type == AssetType.video)
+              .length;
+        }
+      }
+    }
+
+    print('总计发现 ${uniqueAssetIds.length} 个资源，其中疑似动态照片相关联资源 $duplicatesCount 个');
+
+    // 从总数中减去可能的关联资源数量
+    final adjustedCount = uniqueAssetIds.length - duplicatesCount;
+    return adjustedCount;
+  }
+
+  /// 预处理扫描，识别Live Photos和动态照片组
+  Future<void> _identifyLivePhotoGroups(List<AssetPathEntity> albums) async {
+    print('开始识别动态照片组...');
+
+    // 按文件名基础部分收集所有资源
+    final Map<String, List<AssetEntity>> assetsByBaseName = {};
+
+    for (final album in albums) {
+      if (_shouldCancel) break;
+
+      final assetCount = await album.assetCountAsync;
+      if (assetCount == 0) continue;
+
+      const pageSize = 100; // 增大批量，加快处理
+      int page = 0;
+
+      while (!_shouldCancel) {
+        final List<AssetEntity> assets = await album.getAssetListPaged(
+          page: page,
+          size: pageSize,
+        );
+
+        if (assets.isEmpty) break;
+
+        // 收集所有资源信息，按文件名基础部分分组
+        for (final asset in assets) {
+          final fileName = asset.title ?? '';
+          if (fileName.isEmpty) continue;
+
+          final baseName = path.basenameWithoutExtension(fileName);
+          if (baseName.isEmpty) continue;
+
+          if (!assetsByBaseName.containsKey(baseName)) {
+            assetsByBaseName[baseName] = [];
+          }
+          assetsByBaseName[baseName]!.add(asset);
+        }
+
+        page++;
+        if (assets.length < pageSize) break; // 处理完毕
+
+        // 短暂暂停让UI响应
+        await Future.delayed(const Duration(milliseconds: 20));
+      }
+    }
+
+    // 分析所有同名资源组，找出动态照片
+    int identifiedGroups = 0;
+    for (final entry in assetsByBaseName.entries) {
+      final baseName = entry.key;
+      final assets = entry.value;
+
+      // 忽略单个资源
+      if (assets.length <= 1) continue;
+
+      // 检查是否包含图片和视频组合
+      final imageAssets = assets
+          .where((a) => a.type == AssetType.image)
+          .toList();
+      final videoAssets = assets
+          .where((a) => a.type == AssetType.video)
+          .toList();
+
+      if (imageAssets.isEmpty || videoAssets.isEmpty) continue;
+
+      // 找到了可能的动态照片组合
+      // 进一步检查创建时间是否接近（5秒内）
+      for (final image in imageAssets) {
+        final imageTime = image.createDateTime.millisecondsSinceEpoch;
+
+        for (final video in videoAssets) {
+          final videoTime = video.createDateTime.millisecondsSinceEpoch;
+          final timeDiff = (imageTime - videoTime).abs();
+
+          // 如果创建时间相差在5秒内，认为是同一个动态照片
+          if (timeDiff < 5000) {
+            print(
+              '找到动态照片组: ${image.title} (${image.id}) + ${video.title} (${video.id})',
+            );
+
+            // 将图片作为主资源，视频作为关联资源
+            if (!_livePhotoGroups.containsKey(image.id)) {
+              _livePhotoGroups[image.id] = [];
+            }
+            _livePhotoGroups[image.id]!.add(video.id);
+            identifiedGroups++;
+          }
+        }
+      }
+    }
+
+    print(
+      '动态照片组识别完成，找到 $identifiedGroups 组，涉及 ${_livePhotoGroups.length} 个主资源',
+    );
+
+    // 打印总计需要忽略的资源数量
+    int ignoredCount = 0;
+    for (final relatedIds in _livePhotoGroups.values) {
+      ignoredCount += relatedIds.length;
+    }
+
+    print('将忽略 $ignoredCount 个关联资源（主要是视频部分）');
+
+    // 更新实际处理的文件数量
+    if (_totalFiles > ignoredCount) {
+      _totalFiles -= ignoredCount;
+      notifyListeners();
+    }
   }
 
   /// 流式处理和同步（替代原来的扫描+同步两个步骤）
@@ -246,6 +414,9 @@ class PhotoSyncService extends ChangeNotifier {
     _failedFiles = 0;
     _shouldCancel = false;
     _currentUploading = null;
+    // 清空已处理资源记录
+    _processedAssetIds.clear();
+    _livePhotoGroups.clear();
     notifyListeners();
 
     try {
@@ -264,21 +435,6 @@ class PhotoSyncService extends ChangeNotifier {
       // 确保相册文件夹存在
       await _ensureAlbumFolderExists(webDavService);
 
-      // 快速获取总文件数
-      final totalCount = await _getFilesTotalCount();
-      final maxProcessFiles = totalCount > MAX_FILES_PER_SESSION
-          ? MAX_FILES_PER_SESSION
-          : totalCount;
-
-      _totalFiles = maxProcessFiles;
-      print('总计 $totalCount 个文件，本次处理 $maxProcessFiles 个');
-
-      if (totalCount > MAX_FILES_PER_SESSION) {
-        _errorMessage =
-            '检测到 $totalCount 个文件，本次将处理前 $maxProcessFiles 个文件，建议分批次同步';
-        notifyListeners();
-      }
-
       // 获取相册列表
       final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
         type: RequestType.common,
@@ -292,6 +448,25 @@ class PhotoSyncService extends ChangeNotifier {
 
       // 优先处理相机相册
       albums.sort((a, b) => a.name == 'Camera' || a.name == '相机' ? -1 : 1);
+
+      // 预处理扫描，识别Live Photos和动态照片组
+      print('预处理扫描，识别动态照片组...');
+      await _identifyLivePhotoGroups(albums);
+
+      // 快速获取实际处理的总文件数（已经减去动态照片关联项）
+      final totalCount = await _getFilesTotalCount();
+      final maxProcessFiles = totalCount > MAX_FILES_PER_SESSION
+          ? MAX_FILES_PER_SESSION
+          : totalCount;
+
+      _totalFiles = maxProcessFiles;
+      print('总计 $totalCount 个文件，本次处理 $maxProcessFiles 个');
+
+      if (totalCount > MAX_FILES_PER_SESSION) {
+        _errorMessage =
+            '检测到 $totalCount 个文件，本次将处理前 $maxProcessFiles 个文件，建议分批次同步';
+        notifyListeners();
+      }
 
       // 流式处理每个相册
       for (final album in albums) {
@@ -374,7 +549,40 @@ class PhotoSyncService extends ChangeNotifier {
 
         if (_shouldCancel) break;
 
+        // 检查是否已处理过该资源（避免重复处理动态照片的关联资源）
+        if (_processedAssetIds.contains(asset.id)) {
+          print('跳过已处理的资源: ${asset.id}');
+          continue;
+        }
+
+        // 检查该资源是否是某个动态照片的关联资源
+        bool isSecondaryAsset = false;
+        for (final entry in _livePhotoGroups.entries) {
+          if (entry.value.contains(asset.id)) {
+            isSecondaryAsset = true;
+            print('跳过动态照片的关联资源: ${asset.id}，主资源为 ${entry.key}');
+            _processedAssetIds.add(asset.id); // 标记为已处理
+            break;
+          }
+        }
+
+        if (isSecondaryAsset) {
+          // 跳过动态照片的关联资源（只处理主图像）
+          continue;
+        }
+
         await _processAndUploadSingleFile(asset, webDavService);
+
+        // 标记该资源为已处理
+        _processedAssetIds.add(asset.id);
+
+        // 如果这是一个动态照片，标记其关联资源为已处理
+        if (_livePhotoGroups.containsKey(asset.id)) {
+          for (final relatedId in _livePhotoGroups[asset.id]!) {
+            _processedAssetIds.add(relatedId);
+            print('标记动态照片关联资源为已处理: $relatedId');
+          }
+        }
 
         _processedFiles++;
 
@@ -644,38 +852,77 @@ class PhotoSyncService extends ChangeNotifier {
       int totalVideos = 0;
       int totalSize = 0;
 
+      // 使用Set收集唯一资源ID，避免重复计算
+      final Set<String> processedPhotoIds = {};
+      final Set<String> processedVideoIds = {};
+
+      // 按文件名收集资源，用于检测动态照片
+      final Map<String, List<AssetEntity>> assetsByName = {};
+
       // 使用更快的统计方法，只计算数量不读取具体文件
       for (final album in albums) {
-        // 分别获取图片和视频数量
-        final photoCount = await album.assetCountAsync;
-
         // 分批获取资源以避免内存问题
         const batchSize = 100;
-        int processed = 0;
+        int page = 0;
 
-        while (processed < photoCount) {
+        while (true) {
           final assets = await album.getAssetListPaged(
-            page: processed ~/ batchSize,
+            page: page,
             size: batchSize,
           );
 
+          if (assets.isEmpty) break;
+
           for (final asset in assets) {
-            if (asset.type == AssetType.image) {
+            // 按文件名分组
+            final fileName = asset.title ?? '';
+            if (fileName.isNotEmpty) {
+              final baseName = path.basenameWithoutExtension(fileName);
+              if (!assetsByName.containsKey(baseName)) {
+                assetsByName[baseName] = [];
+              }
+              assetsByName[baseName]!.add(asset);
+            }
+
+            if (asset.type == AssetType.image &&
+                !processedPhotoIds.contains(asset.id)) {
               totalPhotos++;
               totalSize += 2 * 1024 * 1024; // 估算图片2MB
-            } else if (asset.type == AssetType.video) {
-              totalVideos++;
-              totalSize += 20 * 1024 * 1024; // 估算视频20MB
+              processedPhotoIds.add(asset.id);
+            } else if (asset.type == AssetType.video &&
+                !processedVideoIds.contains(asset.id)) {
+              // 检查是否为动态照片的一部分
+              bool isPartOfLivePhoto = false;
+              final baseName = path.basenameWithoutExtension(asset.title ?? '');
+
+              if (assetsByName.containsKey(baseName)) {
+                final group = assetsByName[baseName]!;
+                if (group.length > 1 &&
+                    group.any((a) => a.type == AssetType.image)) {
+                  isPartOfLivePhoto = true;
+                }
+              }
+
+              // 如果不是动态照片的一部分，才计算为独立视频
+              if (!isPartOfLivePhoto) {
+                totalVideos++;
+                totalSize += 20 * 1024 * 1024; // 估算视频20MB
+              }
+              processedVideoIds.add(asset.id);
             }
           }
 
-          processed += assets.length;
+          page++;
           if (assets.length < batchSize) break;
 
           // 每批次后短暂暂停，让UI响应
           await Future.delayed(const Duration(milliseconds: 10));
         }
       }
+
+      print(
+        '统计结果：照片 $totalPhotos 张，视频 $totalVideos 个，总计 ${totalPhotos + totalVideos} 个文件',
+      );
 
       return LocalPhotoStatistics(
         totalPhotos: totalPhotos,
@@ -686,7 +933,7 @@ class PhotoSyncService extends ChangeNotifier {
     } catch (e) {
       print('获取本地相册统计失败: $e');
 
-      // 降级方案：只统计总数
+      // 降级方案：使用改进的总数统计
       try {
         final totalCount = await _getFilesTotalCount();
         // 估算图片视频比例 (80% 图片，20% 视频)

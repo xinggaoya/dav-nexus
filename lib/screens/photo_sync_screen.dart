@@ -1161,18 +1161,49 @@ class _PhotoSyncScreenState extends State<PhotoSyncScreen> {
       if (shouldContinue != true) return;
     }
 
-    final webDavService = WebDavService(
-      baseUrl: authProvider.webDavUrl,
-      username: authProvider.username,
-      password: authProvider.password,
+    // 显示加载对话框
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => const AlertDialog(
+        title: Text('准备同步'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('正在识别动态照片和媒体文件，请稍候...'),
+          ],
+        ),
+      ),
     );
 
-    await _syncService.startProcessingAndSync(webDavService);
+    try {
+      final webDavService = WebDavService(
+        baseUrl: authProvider.webDavUrl,
+        username: authProvider.username,
+        password: authProvider.password,
+      );
 
-    // 同步完成后刷新所有统计信息
-    await _loadStatistics();
-    await _loadLocalStatistics();
-    await _loadRecentRecords();
+      // 关闭加载对话框
+      Navigator.of(context).pop();
+
+      await _syncService.startProcessingAndSync(webDavService);
+
+      // 同步完成后刷新所有统计信息
+      await _loadStatistics();
+      await _loadLocalStatistics();
+      await _loadRecentRecords();
+    } catch (e) {
+      // 关闭加载对话框
+      if (Navigator.canPop(context)) {
+        Navigator.of(context).pop();
+      }
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('准备同步失败: $e')));
+    }
   }
 
   /// 重试失败的文件

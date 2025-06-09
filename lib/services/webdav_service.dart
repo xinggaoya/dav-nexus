@@ -431,26 +431,123 @@ class WebDavService {
       final fromUrl = _buildUrl(from);
       final toUrl = _buildUrl(to);
 
-      final response = await _dio.request(
-        fromUrl,
-        options: Options(
-          method: 'MOVE',
-          headers: {
-            'Destination': toUrl,
-            'Overwrite': 'T', // 允许覆盖
-          },
-          validateStatus: (status) {
-            // 接受更多的状态码
-            return status != null && status >= 200 && status < 400;
-          },
-        ),
-      );
+      print('移动操作 - fromUrl: $fromUrl'); // 调试日志
+      print('移动操作 - toUrl: $toUrl'); // 调试日志
 
-      return response.statusCode == 201 ||
-          response.statusCode == 204 ||
-          response.statusCode == 200;
+      // 先检查目标路径是否已存在
+      final toExists = await fileExists(to);
+      if (toExists) {
+        print('目标路径已存在，无法移动'); // 调试日志
+        throw Exception('目标路径已存在，请使用其他名称');
+      }
+
+      // 判断是否为文件夹操作，针对文件夹可能需要特殊处理
+      final isDirectory = from.endsWith('/') || to.endsWith('/');
+      print('是否为文件夹操作: $isDirectory'); // 调试日志
+
+      // 对于文件夹，可能需要确保路径末尾有斜杠
+      String finalToUrl = toUrl;
+      if (isDirectory && !finalToUrl.endsWith('/')) {
+        finalToUrl = '$finalToUrl/';
+        print('调整后的目标URL: $finalToUrl'); // 调试日志
+      }
+
+      try {
+        final response = await _dio.request(
+          fromUrl,
+          options: Options(
+            method: 'MOVE',
+            headers: {
+              'Destination': finalToUrl,
+              'Overwrite': 'F', // 不覆盖已存在的内容
+            },
+            validateStatus: (status) {
+              // 接受更多的状态码，包括409冲突，便于更好地处理错误
+              return status != null &&
+                  (status >= 200 && status < 300 ||
+                      status == 409 ||
+                      status == 412);
+            },
+          ),
+        );
+
+        print('移动操作响应状态码: ${response.statusCode}'); // 调试日志
+
+        if (response.statusCode == 409 || response.statusCode == 412) {
+          print('冲突：目标路径可能已存在 - ${response.statusCode}'); // 调试日志
+          throw Exception('目标路径已存在或被锁定，请使用其他名称');
+        }
+
+        return response.statusCode == 201 ||
+            response.statusCode == 204 ||
+            response.statusCode == 200;
+      } catch (requestError) {
+        print('请求异常: $requestError'); // 调试日志
+
+        // 对于文件夹操作，如果失败，尝试备用方法
+        if (isDirectory) {
+          print('尝试使用备用方法移动文件夹'); // 调试日志
+          return await _moveDirectoryFallback(from, to);
+        }
+
+        rethrow;
+      }
     } catch (e) {
+      print('移动操作异常: $e'); // 调试日志
       throw Exception('Error moving: $e');
+    }
+  }
+
+  /// 文件夹移动的备用方法
+  /// 某些WebDAV服务器对文件夹操作有特殊要求，这是一个备用实现
+  Future<bool> _moveDirectoryFallback(String from, String to) async {
+    try {
+      print('执行文件夹移动备用方法 - from: $from, to: $to'); // 调试日志
+
+      // 1. 确保目标文件夹不存在
+      final toExists = await fileExists(to);
+      if (toExists) {
+        throw Exception('目标文件夹已存在');
+      }
+
+      // 2. 创建目标文件夹
+      final createSuccess = await createDirectory(to);
+      if (!createSuccess) {
+        throw Exception('无法创建目标文件夹');
+      }
+
+      print('已创建目标文件夹: $to'); // 调试日志
+
+      // 3. 列出源文件夹中的内容
+      final files = await listDirectory(from);
+      print('源文件夹内文件数量: ${files.length}'); // 调试日志
+
+      // 4. 逐个复制/移动文件
+      for (final file in files) {
+        if (file.path == from) continue; // 跳过文件夹自身
+
+        final relativePath = file.path.substring(from.length);
+        final newPath = to + relativePath;
+
+        print('移动子项 - 从: ${file.path}, 到: $newPath'); // 调试日志
+
+        if (file.isDirectory) {
+          // 递归处理子文件夹
+          await _moveDirectoryFallback(file.path, newPath);
+        } else {
+          // 移动文件
+          await move(file.path, newPath);
+        }
+      }
+
+      // 5. 删除原文件夹（可选，取决于需求）
+      // 在所有内容移动成功后，才删除源文件夹
+      await delete(from);
+
+      return true;
+    } catch (e) {
+      print('文件夹移动备用方法异常: $e'); // 调试日志
+      throw Exception('备用移动方法失败: $e');
     }
   }
 
@@ -525,7 +622,10 @@ class WebDavService {
 
   /// 构建完整的URL
   String _buildUrl(String path) {
+    print('构建URL开始 - 原始路径: $path'); // 调试日志
+
     final cleanPath = _normalizePath(path);
+    print('规范化后路径: $cleanPath'); // 调试日志
 
     // 确保基础URL正确格式化
     String formattedBaseUrl = baseUrl;
@@ -533,15 +633,20 @@ class WebDavService {
       formattedBaseUrl += '/';
     }
 
+    print('格式化后的基础URL: $formattedBaseUrl'); // 调试日志
+
     // 检查路径是否已经包含/dav/前缀
     if (cleanPath.startsWith('/dav/')) {
       // 如果路径已经包含/dav/，则组合域名部分
       final uri = Uri.parse(formattedBaseUrl);
-      return '${uri.scheme}://${uri.host}${cleanPath}';
+      final result = '${uri.scheme}://${uri.host}${cleanPath}';
+      print('包含/dav/前缀的URL: $result'); // 调试日志
+      return result;
     }
 
     // 对于根路径（仅仅是"/"），返回基础URL
     if (cleanPath == '/') {
+      print('根路径URL: $formattedBaseUrl'); // 调试日志
       return formattedBaseUrl;
     }
 
@@ -549,7 +654,9 @@ class WebDavService {
     if (cleanPath.startsWith('/') && !cleanPath.contains('/', 1)) {
       // 这是根目录下的文件，移除开头的斜杠
       String finalPath = cleanPath.substring(1);
-      return '$formattedBaseUrl$finalPath';
+      final result = '$formattedBaseUrl$finalPath';
+      print('根目录下文件URL: $result'); // 调试日志
+      return result;
     }
 
     // 移除路径开头的斜杠，因为基础URL已经以斜杠结尾
@@ -557,18 +664,30 @@ class WebDavService {
         ? cleanPath.substring(1)
         : cleanPath;
 
-    return '$formattedBaseUrl$finalPath';
+    final result = '$formattedBaseUrl$finalPath';
+    print('最终构建的URL: $result'); // 调试日志
+    return result;
   }
 
   /// 规范化路径
   String _normalizePath(String path) {
-    if (path.isEmpty) return '/';
-    if (!path.startsWith('/')) path = '/$path';
+    print('规范化路径开始 - 原始路径: $path'); // 调试日志
+
+    if (path.isEmpty) {
+      print('空路径，返回: /'); // 调试日志
+      return '/';
+    }
+
+    String normalizedPath = path;
+    if (!normalizedPath.startsWith('/')) {
+      normalizedPath = '/$normalizedPath';
+    }
 
     // 移除重复的斜杠
-    path = path.replaceAll(RegExp(r'/+'), '/');
+    normalizedPath = normalizedPath.replaceAll(RegExp(r'/+'), '/');
 
-    return path;
+    print('规范化后的路径: $normalizedPath'); // 调试日志
+    return normalizedPath;
   }
 
   /// 释放资源

@@ -54,9 +54,66 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   PreferredSizeWidget _buildAppBar() {
+    final fileProvider = Provider.of<FileProvider>(context);
+
+    // 选择模式下的AppBar
+    if (fileProvider.isSelectionMode) {
+      return AppBar(
+        leading: IconButton(
+          icon: const Icon(Icons.close),
+          onPressed: () => fileProvider.exitSelectionMode(),
+        ),
+        title: Text('已选择 ${fileProvider.selectedFiles.length} 项'),
+        actions: [
+          // 全选按钮
+          IconButton(
+            icon: const Icon(Icons.select_all),
+            onPressed: () => fileProvider.selectAll(),
+          ),
+
+          // 批量删除按钮
+          IconButton(
+            icon: const Icon(Icons.delete),
+            onPressed: () => _confirmBatchDelete(),
+          ),
+
+          // 更多操作
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              switch (value) {
+                case 'deselect_all':
+                  fileProvider.deselectAll();
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'deselect_all',
+                child: ListTile(
+                  leading: Icon(Icons.deselect),
+                  title: Text('取消全选'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
+          ),
+        ],
+      );
+    }
+
+    // 正常模式下的AppBar
     return AppBar(
       title: const Text(AppConstants.appName),
       actions: [
+        // 批量操作按钮
+        IconButton(
+          icon: const Icon(Icons.checklist),
+          tooltip: '批量操作',
+          onPressed: () {
+            fileProvider.enterSelectionMode();
+          },
+        ),
+
         // 搜索按钮
         IconButton(
           icon: const Icon(Icons.search),
@@ -66,21 +123,17 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
 
         // 视图切换按钮
-        Consumer<FileProvider>(
-          builder: (context, fileProvider, child) {
-            return IconButton(
-              icon: Icon(
-                fileProvider.viewType == FileViewType.list
-                    ? Icons.grid_view
-                    : Icons.list,
-              ),
-              onPressed: () {
-                fileProvider.changeViewType(
-                  fileProvider.viewType == FileViewType.list
-                      ? FileViewType.grid
-                      : FileViewType.list,
-                );
-              },
+        IconButton(
+          icon: Icon(
+            fileProvider.viewType == FileViewType.list
+                ? Icons.grid_view
+                : Icons.list,
+          ),
+          onPressed: () {
+            fileProvider.changeViewType(
+              fileProvider.viewType == FileViewType.list
+                  ? FileViewType.grid
+                  : FileViewType.list,
             );
           },
         ),
@@ -157,6 +210,72 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// 确认批量删除
+  Future<void> _confirmBatchDelete() async {
+    final fileProvider = Provider.of<FileProvider>(context, listen: false);
+
+    if (fileProvider.selectedFiles.isEmpty) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('请先选择要删除的文件或文件夹')));
+      return;
+    }
+
+    final count = fileProvider.selectedFiles.length;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('确认批量删除'),
+        content: Text('您确定要删除选中的 $count 项吗？此操作无法撤销。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('取消'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.errorColor,
+            ),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      final authProvider = Provider.of<AuthProvider>(context, listen: false);
+
+      if (authProvider.webDavService != null) {
+        try {
+          final success = await fileProvider.deleteSelectedFiles(
+            authProvider.webDavService!,
+          );
+
+          if (success) {
+            ScaffoldMessenger.of(
+              context,
+            ).showSnackBar(SnackBar(content: Text('成功删除 $count 项')));
+          } else {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(fileProvider.errorMessage ?? '批量删除失败'),
+                backgroundColor: AppTheme.errorColor,
+              ),
+            );
+          }
+        } catch (e) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('批量删除失败: $e'),
+              backgroundColor: AppTheme.errorColor,
+            ),
+          );
+        }
+      }
+    }
+  }
+
   Widget _buildBody() {
     return Consumer<FileProvider>(
       builder: (context, fileProvider, child) {
@@ -191,23 +310,37 @@ class _HomeScreenState extends State<HomeScreen> {
           itemCount: fileProvider.files.length,
           itemBuilder: (context, index) {
             final file = fileProvider.files[index];
+            final isSelected = fileProvider.selectedFiles.contains(file.path);
+
             return Card(
               margin: const EdgeInsets.symmetric(
                 horizontal: AppConstants.paddingMedium,
                 vertical: 4,
               ),
               child: ListTile(
-                leading: FileThumbnail(
-                  file: file,
-                  size: 40,
-                  baseUrl: authProvider.webDavService?.baseUrl,
-                  authHeader: authProvider.webDavService?.authHeader,
-                ),
+                leading: fileProvider.isSelectionMode
+                    ? Checkbox(
+                        value: isSelected,
+                        onChanged: (_) => fileProvider.selectFile(file.path),
+                      )
+                    : FileThumbnail(
+                        file: file,
+                        size: 40,
+                        baseUrl: authProvider.webDavService?.baseUrl,
+                        authHeader: authProvider.webDavService?.authHeader,
+                      ),
                 title: Text(file.name),
                 subtitle: file.isDirectory
                     ? null
                     : Text('${file.formattedSize} • ${file.formattedDate}'),
-                onTap: () => _handleFileTap(file),
+                selected: isSelected && fileProvider.isSelectionMode,
+                onTap: () {
+                  if (fileProvider.isSelectionMode) {
+                    fileProvider.selectFile(file.path);
+                  } else {
+                    _handleFileTap(file);
+                  }
+                },
                 onLongPress: () => _handleFileLongPress(file),
               ),
             );
@@ -231,43 +364,82 @@ class _HomeScreenState extends State<HomeScreen> {
           itemCount: fileProvider.files.length,
           itemBuilder: (context, index) {
             final file = fileProvider.files[index];
+            final isSelected = fileProvider.selectedFiles.contains(file.path);
+
             return Card(
-              child: InkWell(
-                onTap: () => _handleFileTap(file),
-                onLongPress: () => _handleFileLongPress(file),
-                borderRadius: BorderRadius.circular(AppConstants.borderRadius),
-                child: Padding(
-                  padding: const EdgeInsets.all(AppConstants.paddingMedium),
-                  child: Column(
-                    children: [
-                      Expanded(
-                        child: FileThumbnail(
-                          file: file,
-                          size: 80,
-                          baseUrl: authProvider.webDavService?.baseUrl,
-                          authHeader: authProvider.webDavService?.authHeader,
-                        ),
+              child: Stack(
+                children: <Widget>[
+                  // 明确指定children为Widget列表
+                  InkWell(
+                    onTap: () {
+                      if (fileProvider.isSelectionMode) {
+                        fileProvider.selectFile(file.path);
+                      } else {
+                        _handleFileTap(file);
+                      }
+                    },
+                    onLongPress: () => _handleFileLongPress(file),
+                    borderRadius: BorderRadius.circular(
+                      AppConstants.borderRadius,
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(AppConstants.paddingMedium),
+                      child: Column(
+                        children: [
+                          Expanded(
+                            child: FileThumbnail(
+                              file: file,
+                              size: 80,
+                              baseUrl: authProvider.webDavService?.baseUrl,
+                              authHeader:
+                                  authProvider.webDavService?.authHeader,
+                            ),
+                          ),
+                          const SizedBox(height: AppConstants.paddingSmall),
+                          Text(
+                            file.name,
+                            textAlign: TextAlign.center,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          if (!file.isDirectory &&
+                              file.formattedSize.isNotEmpty) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              file.formattedSize,
+                              style: Theme.of(context).textTheme.bodySmall
+                                  ?.copyWith(color: AppTheme.textHint),
+                            ),
+                          ],
+                        ],
                       ),
-                      const SizedBox(height: AppConstants.paddingSmall),
-                      Text(
-                        file.name,
-                        textAlign: TextAlign.center,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      if (!file.isDirectory &&
-                          file.formattedSize.isNotEmpty) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          file.formattedSize,
-                          style: Theme.of(context).textTheme.bodySmall
-                              ?.copyWith(color: AppTheme.textHint),
-                        ),
-                      ],
-                    ],
+                    ),
                   ),
-                ),
+                  if (fileProvider.isSelectionMode)
+                    Positioned(
+                      top: 4,
+                      right: 4,
+                      child: Container(
+                        decoration: BoxDecoration(
+                          color: isSelected
+                              ? Theme.of(context).primaryColor
+                              : Colors.grey.withOpacity(0.7),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.all(4.0),
+                          child: Icon(
+                            isSelected
+                                ? Icons.check
+                                : Icons.check_box_outline_blank,
+                            color: Colors.white,
+                            size: 18,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             );
           },
@@ -691,9 +863,8 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!file.isDirectory) {
       _showFileOptions(file);
     } else {
-      // 对于文件夹，还是进入选择模式
-      final fileProvider = Provider.of<FileProvider>(context, listen: false);
-      fileProvider.selectFile(file.path);
+      // 对于文件夹，显示文件夹操作菜单
+      _showFolderOptions(file);
     }
   }
 
@@ -1204,9 +1375,25 @@ class _HomeScreenState extends State<HomeScreen> {
           );
         }
       } catch (e) {
+        // 提取友好的错误信息
+        String errorMessage = '重命名失败';
+
+        final errorStr = e.toString().toLowerCase();
+        if (errorStr.contains('目标路径已存在') ||
+            errorStr.contains('already exists')) {
+          errorMessage = '该名称已被使用，请使用其他名称';
+        } else if (errorStr.contains('permission') || errorStr.contains('权限')) {
+          errorMessage = '没有权限重命名此${file.isDirectory ? '文件夹' : '文件'}';
+        } else if (errorStr.contains('locked') || errorStr.contains('锁定')) {
+          errorMessage = '该${file.isDirectory ? '文件夹' : '文件'}当前被锁定，请稍后再试';
+        } else if (errorStr.contains('500')) {
+          errorMessage =
+              '服务器无法完成重命名，请检查${file.isDirectory ? '文件夹' : '文件'}名称是否有效';
+        }
+
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('重命名失败: $e'),
+            content: Text(errorMessage),
             backgroundColor: AppTheme.errorColor,
           ),
         );
@@ -1315,5 +1502,54 @@ class _HomeScreenState extends State<HomeScreen> {
       await authProvider.logout();
       Navigator.of(context).pushReplacementNamed('/login');
     }
+  }
+
+  /// 显示文件夹操作菜单
+  void _showFolderOptions(WebDavFile folder) {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => Container(
+        padding: const EdgeInsets.all(AppConstants.paddingMedium),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              folder.name,
+              style: Theme.of(context).textTheme.titleMedium,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            const SizedBox(height: AppConstants.paddingMedium),
+            ListTile(
+              leading: const Icon(Icons.folder_open),
+              title: const Text('打开'),
+              onTap: () {
+                Navigator.pop(context);
+                _handleFileTap(folder);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('重命名'),
+              onTap: () {
+                Navigator.pop(context);
+                _showRenameDialog(folder);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete, color: AppTheme.errorColor),
+              title: const Text(
+                '删除',
+                style: TextStyle(color: AppTheme.errorColor),
+              ),
+              onTap: () {
+                Navigator.pop(context);
+                _confirmDelete(folder);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

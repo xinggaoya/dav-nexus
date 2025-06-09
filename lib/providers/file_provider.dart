@@ -210,6 +210,12 @@ class FileProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 进入选择模式
+  void enterSelectionMode() {
+    _isSelectionMode = true;
+    notifyListeners();
+  }
+
   /// 退出选择模式
   void exitSelectionMode() {
     _selectedFiles.clear();
@@ -304,8 +310,73 @@ class FileProvider extends ChangeNotifier {
     String newName,
   ) async {
     try {
+      print('重命名开始 - oldPath: $oldPath, newName: $newName'); // 调试日志
+
+      // 验证新名称是否有效
+      if (newName.trim().isEmpty) {
+        _errorMessage = '名称不能为空';
+        notifyListeners();
+        return false;
+      }
+
+      // 验证名称是否包含非法字符
+      final invalidChars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+      for (final char in invalidChars) {
+        if (newName.contains(char)) {
+          _errorMessage = '名称不能包含以下字符: / \\ : * ? " < > |';
+          notifyListeners();
+          return false;
+        }
+      }
+
       final file = _files.firstWhere((f) => f.path == oldPath);
-      final parentPath = file.parentPath;
+      print(
+        '找到文件 - isDirectory: ${file.isDirectory}, name: ${file.name}, path: ${file.path}',
+      ); // 调试日志
+
+      // 检查是否已存在同名文件
+      final sameName = _files.where(
+        (f) =>
+            f.path != oldPath &&
+            f.name.toLowerCase() == newName.toLowerCase() &&
+            f.parentPath == file.parentPath,
+      );
+
+      if (sameName.isNotEmpty) {
+        _errorMessage = '同一目录下已存在相同名称的文件或文件夹';
+        notifyListeners();
+        return false;
+      }
+
+      // 修正：直接从路径中获取父路径，避免使用parentPath方法可能的问题
+      String parentPath = '';
+      if (file.isDirectory) {
+        // 对于目录，需要特殊处理
+        final segments = oldPath.split('/').where((s) => s.isNotEmpty).toList();
+
+        if (segments.isEmpty) {
+          parentPath = '/';
+        } else {
+          // 移除最后一个部分（当前文件夹名）
+          segments.removeLast();
+
+          // 重建父路径 - 修复: 不要重复添加/dav/前缀
+          if (oldPath.startsWith('/dav/')) {
+            // 如果原路径是 /dav/folder/，父路径应该是 /dav/
+            // 如果原路径是 /dav/folder/subfolder/，父路径应该是 /dav/folder/
+            parentPath = segments.isEmpty
+                ? '/dav/'
+                : '/dav/${segments.sublist(1).join('/')}/';
+          } else {
+            parentPath = segments.isEmpty ? '/' : '/${segments.join('/')}/';
+          }
+        }
+      } else {
+        // 对于文件，可以使用file.parentPath
+        parentPath = file.parentPath;
+      }
+
+      print('计算的父路径: $parentPath'); // 调试日志
 
       // 构建新路径
       String newPath;
@@ -321,7 +392,11 @@ class FileProvider extends ChangeNotifier {
             : '$parentPath/$newName';
       }
 
+      print('构建新路径 - newPath: $newPath'); // 调试日志
+
       final success = await webDavService.move(oldPath, newPath);
+
+      print('移动操作结果: $success'); // 调试日志
 
       if (success) {
         await refresh(webDavService);
@@ -329,6 +404,7 @@ class FileProvider extends ChangeNotifier {
 
       return success;
     } catch (e) {
+      print('重命名异常: $e'); // 调试日志
       _errorMessage = '重命名失败: $e';
       notifyListeners();
       return false;
