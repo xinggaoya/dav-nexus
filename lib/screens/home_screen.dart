@@ -11,6 +11,7 @@ import '../constants/app_constants.dart';
 import '../constants/app_theme.dart';
 import '../widgets/file_thumbnail.dart';
 import '../utils/file_utils.dart';
+import '../utils/app_exit_handler.dart';
 import 'file_preview_screen.dart';
 
 /// 主页面（文件管理器）
@@ -112,6 +113,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 _refreshDirectory();
                 break;
               case 'settings':
+                // 重置退出状态，避免从设置页面返回时意外触发退出
+                AppExitHandler.reset();
                 Navigator.of(context).pushNamed('/settings');
                 break;
               case 'logout':
@@ -345,7 +348,24 @@ class _HomeScreenState extends State<HomeScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Icon(Icons.cloud, color: Colors.white, size: 48),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: Image.asset(
+                        'assets/icons/app_icon.png',
+                        width: 48,
+                        height: 48,
+                        fit: BoxFit.contain,
+                        color: Colors.white,
+                        colorBlendMode: BlendMode.srcATop,
+                        errorBuilder: (context, error, stackTrace) {
+                          return const Icon(
+                            Icons.cloud,
+                            color: Colors.white,
+                            size: 48,
+                          );
+                        },
+                      ),
+                    ),
                     const SizedBox(height: AppConstants.paddingMedium),
                     Text(
                       AppConstants.appName,
@@ -389,6 +409,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       title: const Text('相册同步'),
                       onTap: () {
                         Navigator.pop(context);
+                        // 重置退出状态，避免从子页面返回时意外触发退出
+                        AppExitHandler.reset();
                         Navigator.of(context).pushNamed('/photo_sync');
                       },
                     ),
@@ -397,6 +419,8 @@ class _HomeScreenState extends State<HomeScreen> {
                       title: const Text('设置'),
                       onTap: () {
                         Navigator.pop(context);
+                        // 重置退出状态，避免从设置页面返回时意外触发退出
+                        AppExitHandler.reset();
                         Navigator.of(context).pushNamed('/settings');
                       },
                     ),

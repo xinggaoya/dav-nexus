@@ -167,6 +167,66 @@ class SyncDatabaseService {
     return maps.map((map) => PhotoSyncRecord.fromMap(map)).toList();
   }
 
+  /// 分页获取记录
+  static Future<List<PhotoSyncRecord>> getRecordsPaged({
+    required int page,
+    required int pageSize,
+    SyncStatus? filterStatus,
+  }) async {
+    final db = await database;
+
+    List<Object?> whereArgs = [];
+    String whereClause = '';
+
+    if (filterStatus != null) {
+      whereClause = 'WHERE status = ?';
+      whereArgs.add(filterStatus.index);
+    }
+
+    final maps = await db.rawQuery(
+      '''
+      SELECT * FROM $_tableName 
+      $whereClause
+      ORDER BY created_time DESC
+      LIMIT ? OFFSET ?
+    ''',
+      [...whereArgs, pageSize, page * pageSize],
+    );
+
+    return maps.map((map) => PhotoSyncRecord.fromMap(map)).toList();
+  }
+
+  /// 获取记录总数
+  static Future<int> getTotalRecordsCount({SyncStatus? filterStatus}) async {
+    final db = await database;
+
+    String whereClause = '';
+    List<Object?> whereArgs = [];
+
+    if (filterStatus != null) {
+      whereClause = 'WHERE status = ?';
+      whereArgs.add(filterStatus.index);
+    }
+
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) as count FROM $_tableName $whereClause',
+      whereArgs,
+    );
+    return result.first['count'] as int;
+  }
+
+  /// 清空所有记录
+  static Future<int> clearAllRecords() async {
+    final db = await database;
+    return await db.delete(_tableName);
+  }
+
+  /// 删除单个记录
+  static Future<int> deleteRecord(String id) async {
+    final db = await database;
+    return await db.delete(_tableName, where: 'id = ?', whereArgs: [id]);
+  }
+
   /// 更新记录状态
   static Future<int> updateStatus(
     String id,

@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:convert';
+import 'dart:isolate';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:photo_manager/photo_manager.dart';
@@ -10,17 +11,22 @@ import 'package:path/path.dart' as path;
 import '../models/photo_sync_record.dart';
 import '../services/sync_database_service.dart';
 import '../services/webdav_service.dart';
+import '../services/notification_service.dart';
+import '../providers/app_settings_provider.dart';
 
 /// 相册同步服务
 class PhotoSyncService extends ChangeNotifier {
   static const String ALBUM_FOLDER_NAME = '相册';
-  static const int BATCH_SIZE = 10; // 批量处理大小
+  static const int BATCH_SIZE = 3; // 减少批量处理大小
   static const int MAX_RETRY_COUNT = 3; // 最大重试次数
+  static const int PROCESS_BATCH_SIZE = 1; // 流式处理批次大小
+  static const int MAX_FILES_PER_SESSION = 2000; // 增加处理限制
 
-  bool _isScanning = false;
-  bool _isSyncing = false;
+  bool _isProcessing = false; // 改为处理状态，不再区分扫描和同步
   bool _isInitialized = false;
   String? _errorMessage;
+  bool _shouldCancel = false;
+  bool _isPaused = false; // 添加暂停状态
 
   int _totalFiles = 0;
   int _processedFiles = 0;
@@ -29,10 +35,13 @@ class PhotoSyncService extends ChangeNotifier {
   int _failedFiles = 0;
 
   PhotoSyncRecord? _currentUploading;
+  AppSettingsProvider? _appSettings;
 
   // Getters
-  bool get isScanning => _isScanning;
-  bool get isSyncing => _isSyncing;
+  bool get isScanning => false; // 不再有扫描阶段
+  bool get isSyncing => _isProcessing; // 兼容原有接口
+  bool get isProcessing => _isProcessing;
+  bool get isPaused => _isPaused;
   bool get isInitialized => _isInitialized;
   String? get errorMessage => _errorMessage;
   int get totalFiles => _totalFiles;
@@ -47,6 +56,77 @@ class PhotoSyncService extends ChangeNotifier {
     return _processedFiles / _totalFiles;
   }
 
+  String get progressPercent {
+    return '${(progress * 100).toStringAsFixed(1)}%';
+  }
+
+  /// 设置应用设置提供者
+  void setAppSettings(AppSettingsProvider appSettings) {
+    _appSettings = appSettings;
+  }
+
+  /// 检查是否应该自动同步
+  bool get shouldAutoSync {
+    return _appSettings?.autoSync ?? false;
+  }
+
+  /// 检查是否仅WiFi同步
+  bool get shouldSyncWifiOnly {
+    return _appSettings?.autoSyncWifiOnly ?? false;
+  }
+
+  /// 检查是否自动备份
+  bool get shouldAutoBackup {
+    return _appSettings?.autoBackup ?? false;
+  }
+
+  /// 取消当前操作
+  void cancelCurrentOperation() {
+    _shouldCancel = true;
+    _isProcessing = false;
+    _isPaused = false;
+
+    // 发送取消通知
+    NotificationService.showSyncCancelled();
+    NotificationService.clearSyncNotification();
+
+    notifyListeners();
+  }
+
+  /// 暂停处理
+  void pauseProcessing() {
+    if (_isProcessing && !_isPaused) {
+      _isPaused = true;
+
+      // 发送暂停通知
+      NotificationService.showSyncPaused(
+        current: _processedFiles,
+        total: _totalFiles,
+      );
+
+      notifyListeners();
+    }
+  }
+
+  /// 恢复处理
+  void resumeProcessing() {
+    if (_isProcessing && _isPaused) {
+      _isPaused = false;
+
+      // 清除暂停通知，继续显示进度通知
+      NotificationService.updateSyncProgress(
+        current: _processedFiles,
+        total: _totalFiles,
+        uploaded: _uploadedFiles,
+        failed: _failedFiles,
+        skipped: _skippedFiles,
+        currentFileName: _currentUploading?.fileName,
+      );
+
+      notifyListeners();
+    }
+  }
+
   /// 初始化同步服务
   Future<bool> initialize() async {
     if (_isInitialized) return true;
@@ -58,6 +138,9 @@ class PhotoSyncService extends ChangeNotifier {
         _errorMessage = '没有相册访问权限';
         return false;
       }
+
+      // 初始化通知服务
+      await NotificationService.initialize();
 
       _isInitialized = true;
       _errorMessage = null;
@@ -129,399 +212,366 @@ class PhotoSyncService extends ChangeNotifier {
     }
   }
 
-  /// 扫描本地相册
-  Future<void> scanLocalPhotos() async {
-    if (_isScanning) return;
+  /// 快速获取文件总数
+  Future<int> _getFilesTotalCount() async {
+    print('正在快速计算文件总数...');
 
-    _isScanning = true;
+    // 获取所有相册
+    final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
+      type: RequestType.common,
+      onlyAll: false,
+    );
+
+    int totalCount = 0;
+    for (final album in albums) {
+      final count = await album.assetCountAsync;
+      totalCount += count;
+
+      // 短暂暂停，让UI响应
+      await Future.delayed(const Duration(milliseconds: 10));
+    }
+
+    return totalCount;
+  }
+
+  /// 流式处理和同步（替代原来的扫描+同步两个步骤）
+  Future<void> startProcessingAndSync(WebDavService webDavService) async {
+    if (_isProcessing) return;
+
+    _isProcessing = true;
     _errorMessage = null;
+    _processedFiles = 0;
+    _uploadedFiles = 0;
+    _skippedFiles = 0;
+    _failedFiles = 0;
+    _shouldCancel = false;
+    _currentUploading = null;
     notifyListeners();
 
     try {
-      print('开始扫描本地相册...');
+      print('开始流式处理和同步...');
 
-      // 再次检查权限
+      // 发送开始通知
+      await NotificationService.showSyncStarted();
+
+      // 检查权限
       final hasPermission = await _requestPhotoPermission();
       if (!hasPermission) {
         _errorMessage = '没有相册访问权限，请在设置中允许访问相册';
         return;
       }
 
-      print('权限检查通过，获取相册列表...');
-
-      // 获取所有相册
-      final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
-        type: RequestType.common, // 包含图片和视频
-        onlyAll: false,
-      );
-
-      print('找到 ${albums.length} 个相册');
-
-      if (albums.isEmpty) {
-        _errorMessage = '未找到任何相册，请确保设备中有照片或视频';
-        return;
-      }
-
-      // 先获取总数进行内存估算
-      int totalAssets = 0;
-      for (final album in albums) {
-        final assetCount = await album.assetCountAsync;
-        totalAssets += assetCount;
-      }
-
-      print('总计 $totalAssets 个文件');
-
-      // 如果文件数量过多，给出警告并限制处理数量
-      const maxProcessFiles = 5000; // 最大处理文件数
-      if (totalAssets > maxProcessFiles) {
-        _errorMessage =
-            '检测到 $totalAssets 个文件，为防止内存不足，本次将只处理前 $maxProcessFiles 个文件。建议分批次同步。';
-        notifyListeners();
-      }
-
-      final List<PhotoSyncRecord> newRecords = [];
-      int processedAssets = 0;
-
-      // 遍历所有相册
-      for (final album in albums) {
-        if (processedAssets >= maxProcessFiles) {
-          print('已达到最大处理数量限制，停止扫描');
-          break;
-        }
-
-        print('处理相册: ${album.name}');
-
-        final assetCount = await album.assetCountAsync;
-        print('相册 ${album.name} 包含 $assetCount 个文件');
-
-        if (assetCount == 0) continue;
-
-        // 分页获取资源，避免一次性加载过多
-        const pageSize = 50; // 减少页面大小以降低内存压力
-        int page = 0;
-        int albumProcessedCount = 0;
-
-        while (true) {
-          // 检查是否已达到总体限制
-          if (processedAssets >= maxProcessFiles) {
-            break;
-          }
-
-          final List<AssetEntity> assets = await album.getAssetListPaged(
-            page: page,
-            size: pageSize,
-          );
-
-          if (assets.isEmpty) break;
-
-          print('处理第 ${page + 1} 页，${assets.length} 个文件');
-
-          // 分批处理资源以避免内存压力
-          const batchSize = 10;
-          for (int i = 0; i < assets.length; i += batchSize) {
-            if (processedAssets >= maxProcessFiles) break;
-
-            final batch = assets.skip(i).take(batchSize).toList();
-            await _processAssetBatch(batch, newRecords);
-
-            processedAssets += batch.length;
-            albumProcessedCount += batch.length;
-
-            // 更新进度
-            _processedFiles = processedAssets;
-            notifyListeners();
-
-            // 定期释放内存
-            if (processedAssets % 100 == 0) {
-              await Future.delayed(
-                const Duration(milliseconds: 50),
-              ); // 短暂暂停释放内存
-            }
-          }
-
-          page++;
-
-          // 限制最大页数，避免无限循环
-          if (page > 100) {
-            print('相册 ${album.name} 页数过多，跳过剩余部分');
-            break;
-          }
-        }
-
-        print('相册 ${album.name} 处理完成，处理了 $albumProcessedCount 个文件');
-      }
-
-      print('扫描完成，总计处理 $processedAssets 个文件，新增 ${newRecords.length} 个待同步文件');
-
-      // 批量插入新记录
-      if (newRecords.isNotEmpty) {
-        await SyncDatabaseService.insertBatch(newRecords);
-        print('已保存 ${newRecords.length} 条新记录到数据库');
-      }
-
-      _totalFiles = newRecords.length;
-      _processedFiles = processedAssets;
-
-      if (newRecords.isEmpty && processedAssets > 0) {
-        _errorMessage = '所有已扫描的文件都已存在记录，没有新文件需要同步';
-      }
-    } catch (e) {
-      print('扫描相册失败: $e');
-      _errorMessage = '扫描相册失败: $e';
-    } finally {
-      _isScanning = false;
-      notifyListeners();
-    }
-  }
-
-  /// 分批处理资源
-  Future<void> _processAssetBatch(
-    List<AssetEntity> assets,
-    List<PhotoSyncRecord> newRecords,
-  ) async {
-    for (final asset in assets) {
-      try {
-        // 检查资源是否存在
-        if (!await asset.exists) {
-          print('跳过已删除的资源: ${asset.id}');
-          continue;
-        }
-
-        // 获取文件（添加超时和错误处理）
-        File? file;
-        try {
-          file = await asset.file?.timeout(
-            const Duration(seconds: 10),
-            onTimeout: () => null,
-          );
-        } catch (e) {
-          print('获取文件超时或失败: ${asset.id}, 错误: $e');
-          continue;
-        }
-
-        if (file == null) {
-          print('无法获取文件: ${asset.id}');
-          continue;
-        }
-
-        if (!await file.exists()) {
-          print('文件不存在: ${file.path}');
-          continue;
-        }
-
-        // 检查文件大小（跳过过大的文件以防止内存问题）
-        final fileStats = await file.stat();
-        const maxFileSize = 100 * 1024 * 1024; // 100MB 限制
-        if (fileStats.size > maxFileSize) {
-          print('文件过大，跳过: ${file.path} (${fileStats.size} bytes)');
-          continue;
-        }
-
-        // 计算文件哈希（添加错误处理）
-        String fileHash;
-        try {
-          fileHash = await _calculateFileHash(file);
-        } catch (e) {
-          print('计算文件哈希失败: ${file.path}, 错误: $e');
-          continue;
-        }
-
-        // 检查是否已存在
-        final existingRecord = await SyncDatabaseService.getByHash(fileHash);
-        if (existingRecord != null) {
-          print('文件已存在记录，跳过: ${file.path}');
-          continue;
-        }
-
-        // 创建新的同步记录
-        final record = PhotoSyncRecord(
-          id: asset.id,
-          localPath: file.path,
-          fileName: path.basename(file.path),
-          fileHash: fileHash,
-          fileSize: fileStats.size,
-          createdTime: asset.createDateTime,
-          modifiedTime: asset.modifiedDateTime,
-          remotePath: await _generateRemotePath(file.path),
-          status: SyncStatus.pending,
-        );
-
-        newRecords.add(record);
-        print('添加新记录: ${record.fileName}');
-      } catch (e) {
-        print('处理资源失败: ${asset.id}, 错误: $e');
-        // 继续处理下一个资源，不中断整个流程
-      }
-    }
-  }
-
-  /// 开始同步
-  Future<void> startSync(WebDavService webDavService) async {
-    if (_isSyncing) return;
-
-    _isSyncing = true;
-    _errorMessage = null;
-    _processedFiles = 0;
-    _uploadedFiles = 0;
-    _skippedFiles = 0;
-    _failedFiles = 0;
-    notifyListeners();
-
-    try {
       // 确保相册文件夹存在
       await _ensureAlbumFolderExists(webDavService);
 
-      // 获取待同步的记录
-      final pendingRecords = await SyncDatabaseService.getPendingRecords();
-      _totalFiles = pendingRecords.length;
+      // 快速获取总文件数
+      final totalCount = await _getFilesTotalCount();
+      final maxProcessFiles = totalCount > MAX_FILES_PER_SESSION
+          ? MAX_FILES_PER_SESSION
+          : totalCount;
 
-      if (_totalFiles == 0) {
-        _isSyncing = false;
+      _totalFiles = maxProcessFiles;
+      print('总计 $totalCount 个文件，本次处理 $maxProcessFiles 个');
+
+      if (totalCount > MAX_FILES_PER_SESSION) {
+        _errorMessage =
+            '检测到 $totalCount 个文件，本次将处理前 $maxProcessFiles 个文件，建议分批次同步';
         notifyListeners();
+      }
+
+      // 获取相册列表
+      final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
+        type: RequestType.common,
+        onlyAll: false,
+      );
+
+      if (albums.isEmpty) {
+        _errorMessage = '未找到任何相册';
         return;
       }
 
-      // 分批处理
-      for (int i = 0; i < pendingRecords.length; i += BATCH_SIZE) {
-        if (!_isSyncing) break; // 检查是否已停止
+      // 优先处理相机相册
+      albums.sort((a, b) => a.name == 'Camera' || a.name == '相机' ? -1 : 1);
 
-        final batch = pendingRecords.skip(i).take(BATCH_SIZE).toList();
-        await _processBatch(webDavService, batch);
+      // 流式处理每个相册
+      for (final album in albums) {
+        if (_shouldCancel || _processedFiles >= maxProcessFiles) {
+          print('处理被取消或达到限制');
+          break;
+        }
+
+        await _processAlbumStreaming(album, webDavService, maxProcessFiles);
+
+        // 检查是否暂停
+        while (_isPaused && !_shouldCancel) {
+          await Future.delayed(const Duration(milliseconds: 100));
+        }
       }
+
+      print(
+        '处理完成！总计: $_totalFiles, 已处理: $_processedFiles, 上传: $_uploadedFiles, 跳过: $_skippedFiles, 失败: $_failedFiles',
+      );
+
+      // 发送完成通知
+      await NotificationService.showSyncCompleted(
+        total: _totalFiles,
+        uploaded: _uploadedFiles,
+        failed: _failedFiles,
+        skipped: _skippedFiles,
+      );
     } catch (e) {
-      _errorMessage = '同步失败: $e';
+      print('处理失败: $e');
+      _errorMessage = '处理失败: $e';
+
+      // 发送失败通知
+      await NotificationService.showSyncCompleted(
+        total: _totalFiles,
+        uploaded: _uploadedFiles,
+        failed: _failedFiles + 1, // 添加此次失败
+        skipped: _skippedFiles,
+      );
     } finally {
-      _isSyncing = false;
+      _isProcessing = false;
       _currentUploading = null;
+
+      // 清除进度通知
+      await NotificationService.clearSyncNotification();
+
       notifyListeners();
     }
   }
 
-  /// 停止同步
-  void stopSync() {
-    _isSyncing = false;
-    _currentUploading = null;
-    notifyListeners();
-  }
-
-  /// 处理批次
-  Future<void> _processBatch(
+  /// 流式处理单个相册
+  Future<void> _processAlbumStreaming(
+    AssetPathEntity album,
     WebDavService webDavService,
-    List<PhotoSyncRecord> batch,
+    int maxProcessFiles,
   ) async {
-    for (final record in batch) {
-      if (!_isSyncing) break;
+    print('流式处理相册: ${album.name}');
 
-      _currentUploading = record;
-      notifyListeners();
+    final assetCount = await album.assetCountAsync;
+    if (assetCount == 0) return;
 
-      await _uploadSingleFile(webDavService, record);
+    const pageSize = 10; // 更小的页面大小
+    int page = 0;
 
-      _processedFiles++;
-      notifyListeners();
+    while (_processedFiles < maxProcessFiles && !_shouldCancel) {
+      final List<AssetEntity> assets = await album.getAssetListPaged(
+        page: page,
+        size: pageSize,
+      );
+
+      if (assets.isEmpty) break;
+
+      // 逐个处理文件
+      for (final asset in assets) {
+        if (_shouldCancel || _processedFiles >= maxProcessFiles) break;
+
+        // 检查是否暂停
+        while (_isPaused && !_shouldCancel) {
+          await Future.delayed(const Duration(milliseconds: 100));
+        }
+
+        if (_shouldCancel) break;
+
+        await _processAndUploadSingleFile(asset, webDavService);
+
+        _processedFiles++;
+
+        // 更新进度通知（如果不是暂停状态）
+        if (!_isPaused) {
+          await NotificationService.updateSyncProgress(
+            current: _processedFiles,
+            total: _totalFiles,
+            uploaded: _uploadedFiles,
+            failed: _failedFiles,
+            skipped: _skippedFiles,
+            currentFileName: _currentUploading?.fileName,
+          );
+        }
+
+        notifyListeners();
+
+        // 短暂暂停让UI响应
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
+
+      page++;
+      if (page > 100) break; // 防止无限循环
     }
   }
 
-  /// 上传单个文件
-  Future<void> _uploadSingleFile(
+  /// 处理并上传单个文件
+  Future<void> _processAndUploadSingleFile(
+    AssetEntity asset,
     WebDavService webDavService,
-    PhotoSyncRecord record,
   ) async {
     try {
-      // 更新状态为上传中
-      await SyncDatabaseService.updateStatus(record.id, SyncStatus.uploading);
-
-      // 检查本地文件是否存在
-      final localFile = File(record.localPath);
-      if (!await localFile.exists()) {
-        await SyncDatabaseService.updateStatus(
-          record.id,
-          SyncStatus.failed,
-          errorMessage: '本地文件不存在',
-        );
-        _failedFiles++;
-        return;
-      }
-
-      // 检查远程文件是否已存在
-      final remoteExists = await webDavService.fileExists(record.remotePath);
-      if (remoteExists) {
-        await SyncDatabaseService.updateStatus(record.id, SyncStatus.skipped);
+      // 检查资源是否存在
+      if (!await asset.exists) {
+        print('跳过已删除的资源: ${asset.id}');
         _skippedFiles++;
         return;
       }
 
-      // 读取文件数据
-      final fileData = await localFile.readAsBytes();
+      // 获取文件
+      File? file;
+      try {
+        file = await asset.file?.timeout(
+          const Duration(seconds: 5),
+          onTimeout: () => null,
+        );
+      } catch (e) {
+        print('获取文件失败: ${asset.id}, 错误: $e');
+        _failedFiles++;
 
-      // 上传文件
-      final success = await webDavService.uploadFile(
-        record.remotePath,
-        fileData,
+        // 创建失败记录
+        final record = PhotoSyncRecord(
+          id: asset.id,
+          localPath: '',
+          fileName: 'unknown_${asset.id}',
+          fileHash: '',
+          fileSize: 0,
+          createdTime: asset.createDateTime,
+          modifiedTime: asset.modifiedDateTime,
+          remotePath: '',
+          status: SyncStatus.failed,
+          errorMessage: '获取文件失败: $e',
+        );
+        await SyncDatabaseService.insertOrUpdate(record);
+        return;
+      }
+
+      if (file == null || !await file.exists()) {
+        print('文件不存在: ${asset.id}');
+        _skippedFiles++;
+        return;
+      }
+
+      // 检查文件大小
+      final fileStats = await file.stat();
+      const maxFileSize = 50 * 1024 * 1024; // 50MB
+      if (fileStats.size > maxFileSize) {
+        print('文件过大，跳过: ${file.path}');
+        _skippedFiles++;
+        return;
+      }
+
+      // 快速计算哈希
+      String fileHash;
+      try {
+        fileHash = await _calculateFileHashFast(file);
+      } catch (e) {
+        print('计算哈希失败: ${file.path}');
+        _skippedFiles++;
+        return;
+      }
+
+      // 检查是否已存在记录
+      final existingRecord = await SyncDatabaseService.getByHash(fileHash);
+      if (existingRecord != null) {
+        if (existingRecord.status == SyncStatus.completed) {
+          print('文件已同步，跳过: ${file.path}');
+          _skippedFiles++;
+          return;
+        }
+      }
+
+      // 创建同步记录
+      final record = PhotoSyncRecord(
+        id: asset.id,
+        localPath: file.path,
+        fileName: path.basename(file.path),
+        fileHash: fileHash,
+        fileSize: fileStats.size,
+        createdTime: asset.createDateTime,
+        modifiedTime: asset.modifiedDateTime,
+        remotePath: await _generateRemotePath(file.path),
+        status: SyncStatus.uploading,
       );
 
+      _currentUploading = record;
+      notifyListeners();
+
+      // 保存记录
+      await SyncDatabaseService.insertOrUpdate(record);
+
+      // 直接上传
+      final success = await _uploadFile(webDavService, record);
+
       if (success) {
+        _uploadedFiles++;
         await SyncDatabaseService.updateStatus(
           record.id,
           SyncStatus.completed,
           lastSyncTime: DateTime.now(),
         );
-        _uploadedFiles++;
+        print('上传成功: ${record.fileName}');
       } else {
-        // 增加重试次数
-        final newRetryCount = record.retryCount + 1;
-        final status = newRetryCount >= MAX_RETRY_COUNT
-            ? SyncStatus.failed
-            : SyncStatus.pending;
-
+        _failedFiles++;
         await SyncDatabaseService.updateStatus(
           record.id,
-          status,
+          SyncStatus.failed,
           errorMessage: '上传失败',
-          retryCount: newRetryCount,
+          lastSyncTime: DateTime.now(),
         );
-
-        if (status == SyncStatus.failed) {
-          _failedFiles++;
-        }
+        print('上传失败: ${record.fileName}');
       }
     } catch (e) {
-      // 处理异常
-      final newRetryCount = record.retryCount + 1;
-      final status = newRetryCount >= MAX_RETRY_COUNT
-          ? SyncStatus.failed
-          : SyncStatus.pending;
-
-      await SyncDatabaseService.updateStatus(
-        record.id,
-        status,
-        errorMessage: e.toString(),
-        retryCount: newRetryCount,
-      );
-
-      if (status == SyncStatus.failed) {
-        _failedFiles++;
-      }
+      print('处理文件失败: ${asset.id}, 错误: $e');
+      _failedFiles++;
     }
   }
 
-  /// 确保相册文件夹存在
-  Future<void> _ensureAlbumFolderExists(WebDavService webDavService) async {
-    final albumPath = '/$ALBUM_FOLDER_NAME/';
-    final exists = await webDavService.fileExists(albumPath);
+  /// 上传单个文件
+  Future<bool> _uploadFile(
+    WebDavService webDavService,
+    PhotoSyncRecord record,
+  ) async {
+    try {
+      final file = File(record.localPath);
+      if (!await file.exists()) {
+        print('文件不存在: ${record.localPath}');
+        return false;
+      }
 
-    if (!exists) {
-      await webDavService.createDirectory(albumPath);
+      final bytes = await file.readAsBytes();
+      final success = await webDavService.uploadFile(record.remotePath, bytes);
+
+      return success;
+    } catch (e) {
+      print('上传文件失败: ${record.fileName}, 错误: $e');
+      return false;
+    }
+  }
+
+  /// 快速计算文件哈希（只计算文件开头部分）
+  Future<String> _calculateFileHashFast(File file) async {
+    try {
+      final fileSize = await file.length();
+      const maxSampleSize = 512 * 1024; // 减少到512KB，更快
+
+      final bytesToRead = fileSize > maxSampleSize ? maxSampleSize : fileSize;
+      final bytes = await file.openRead(0, bytesToRead).first;
+
+      // 结合文件大小和部分内容创建更快的哈希
+      final hash = sha256.convert([...bytes, ...fileSize.toString().codeUnits]);
+      return hash.toString();
+    } catch (e) {
+      // 如果快速方法失败，回退到简单哈希
+      final stats = await file.stat();
+      return '${stats.size}_${stats.modified.millisecondsSinceEpoch}';
     }
   }
 
   /// 生成远程路径
   Future<String> _generateRemotePath(String localPath) async {
     final fileName = path.basename(localPath);
-    final extension = path.extension(fileName).toLowerCase();
 
-    // 根据文件类型分类存储
+    // 根据文件类型分子文件夹
+    final extension = path.extension(fileName).toLowerCase();
     String subFolder = '';
+
     if ([
       '.jpg',
       '.jpeg',
@@ -533,11 +583,11 @@ class PhotoSyncService extends ChangeNotifier {
       subFolder = '图片/';
     } else if ([
       '.mp4',
-      '.mov',
       '.avi',
+      '.mov',
       '.mkv',
-      '.3gp',
       '.webm',
+      '.3gp',
     ].contains(extension)) {
       subFolder = '视频/';
     } else {
@@ -547,28 +597,120 @@ class PhotoSyncService extends ChangeNotifier {
     return '/$ALBUM_FOLDER_NAME/$subFolder$fileName';
   }
 
-  /// 计算文件哈希值
-  Future<String> _calculateFileHash(File file) async {
+  /// 确保相册文件夹存在
+  Future<void> _ensureAlbumFolderExists(WebDavService webDavService) async {
     try {
-      final bytes = await file.readAsBytes();
-      final digest = sha256.convert(bytes);
-      return digest.toString();
+      // 创建主文件夹
+      await webDavService.createDirectory('/$ALBUM_FOLDER_NAME');
+
+      // 创建子文件夹
+      await webDavService.createDirectory('/$ALBUM_FOLDER_NAME/图片');
+      await webDavService.createDirectory('/$ALBUM_FOLDER_NAME/视频');
+      await webDavService.createDirectory('/$ALBUM_FOLDER_NAME/其他');
     } catch (e) {
-      // 如果无法计算哈希，使用文件路径和大小的组合
-      final stat = await file.stat();
-      return sha256
-          .convert(
-            utf8.encode(
-              '${file.path}_${stat.size}_${stat.modified.millisecondsSinceEpoch}',
-            ),
-          )
-          .toString();
+      print('创建相册文件夹失败: $e');
+      // 不抛出异常，因为文件夹可能已存在
     }
+  }
+
+  // 兼容性方法：保留原有接口
+  Future<void> scanLocalPhotos() async {
+    print('scanLocalPhotos 已废弃，请使用 startProcessingAndSync');
+  }
+
+  Future<void> startSync(WebDavService webDavService) async {
+    await startProcessingAndSync(webDavService);
   }
 
   /// 获取同步统计信息
   Future<SyncStatistics> getStatistics() async {
     return await SyncDatabaseService.getStatistics();
+  }
+
+  /// 获取本地相册总统计信息
+  Future<LocalPhotoStatistics> getLocalPhotoStatistics() async {
+    if (!_isInitialized) {
+      await initialize();
+    }
+
+    try {
+      // 获取所有相册
+      final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
+        type: RequestType.common,
+        onlyAll: false,
+      );
+
+      int totalPhotos = 0;
+      int totalVideos = 0;
+      int totalSize = 0;
+
+      // 使用更快的统计方法，只计算数量不读取具体文件
+      for (final album in albums) {
+        // 分别获取图片和视频数量
+        final photoCount = await album.assetCountAsync;
+
+        // 分批获取资源以避免内存问题
+        const batchSize = 100;
+        int processed = 0;
+
+        while (processed < photoCount) {
+          final assets = await album.getAssetListPaged(
+            page: processed ~/ batchSize,
+            size: batchSize,
+          );
+
+          for (final asset in assets) {
+            if (asset.type == AssetType.image) {
+              totalPhotos++;
+              totalSize += 2 * 1024 * 1024; // 估算图片2MB
+            } else if (asset.type == AssetType.video) {
+              totalVideos++;
+              totalSize += 20 * 1024 * 1024; // 估算视频20MB
+            }
+          }
+
+          processed += assets.length;
+          if (assets.length < batchSize) break;
+
+          // 每批次后短暂暂停，让UI响应
+          await Future.delayed(const Duration(milliseconds: 10));
+        }
+      }
+
+      return LocalPhotoStatistics(
+        totalPhotos: totalPhotos,
+        totalVideos: totalVideos,
+        totalFiles: totalPhotos + totalVideos,
+        estimatedSize: totalSize,
+      );
+    } catch (e) {
+      print('获取本地相册统计失败: $e');
+
+      // 降级方案：只统计总数
+      try {
+        final totalCount = await _getFilesTotalCount();
+        // 估算图片视频比例 (80% 图片，20% 视频)
+        final estimatedPhotos = (totalCount * 0.8).round();
+        final estimatedVideos = totalCount - estimatedPhotos;
+
+        return LocalPhotoStatistics(
+          totalPhotos: estimatedPhotos,
+          totalVideos: estimatedVideos,
+          totalFiles: totalCount,
+          estimatedSize:
+              estimatedPhotos * 2 * 1024 * 1024 +
+              estimatedVideos * 20 * 1024 * 1024,
+        );
+      } catch (fallbackError) {
+        print('降级统计也失败: $fallbackError');
+        return LocalPhotoStatistics(
+          totalPhotos: 0,
+          totalVideos: 0,
+          totalFiles: 0,
+          estimatedSize: 0,
+        );
+      }
+    }
   }
 
   /// 重置同步记录
@@ -610,7 +752,22 @@ class PhotoSyncService extends ChangeNotifier {
 
   @override
   void dispose() {
-    _isSyncing = false;
+    _isProcessing = false;
     super.dispose();
   }
+}
+
+/// 本地相册统计信息
+class LocalPhotoStatistics {
+  final int totalPhotos; // 总图片数
+  final int totalVideos; // 总视频数
+  final int totalFiles; // 总文件数
+  final int estimatedSize; // 估算总大小
+
+  LocalPhotoStatistics({
+    required this.totalPhotos,
+    required this.totalVideos,
+    required this.totalFiles,
+    required this.estimatedSize,
+  });
 }

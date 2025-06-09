@@ -37,16 +37,16 @@ class AuthProvider extends ChangeNotifier {
 
       _isLoggedIn = prefs.getBool(AppConstants.keyIsLoggedIn) ?? false;
 
-      // 强制使用新的默认URL，暂时忽略保存的URL
-      _webDavUrl = '';
+      // 从保存的数据中加载WebDAV URL
+      _webDavUrl = prefs.getString(AppConstants.keyWebDavUrl) ?? '';
 
       _username = prefs.getString(AppConstants.keyUsername) ?? '';
       _password = prefs.getString(AppConstants.keyPassword) ?? '';
       _rememberCredentials =
           prefs.getBool(AppConstants.keyRememberCredentials) ?? true;
 
-      // 如果已登录，创建WebDAV服务实例
-      if (_isLoggedIn) {
+      // 如果已登录且有完整的凭据，创建WebDAV服务实例
+      if (_isLoggedIn && _webDavUrl.isNotEmpty) {
         _webDavService = WebDavService(
           baseUrl: _webDavUrl,
           username: _username,
@@ -185,6 +185,7 @@ class AuthProvider extends ChangeNotifier {
         _username = '';
         _password = '';
       }
+      // 如果记住凭据，保留服务器地址、用户名和密码，但重置登录状态
 
       _errorMessage = null;
       notifyListeners();
