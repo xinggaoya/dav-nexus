@@ -162,24 +162,51 @@ class PhotoSyncService extends ChangeNotifier {
         return;
       }
 
-      final List<PhotoSyncRecord> newRecords = [];
+      // 先获取总数进行内存估算
       int totalAssets = 0;
+      for (final album in albums) {
+        final assetCount = await album.assetCountAsync;
+        totalAssets += assetCount;
+      }
+
+      print('总计 $totalAssets 个文件');
+
+      // 如果文件数量过多，给出警告并限制处理数量
+      const maxProcessFiles = 5000; // 最大处理文件数
+      if (totalAssets > maxProcessFiles) {
+        _errorMessage =
+            '检测到 $totalAssets 个文件，为防止内存不足，本次将只处理前 $maxProcessFiles 个文件。建议分批次同步。';
+        notifyListeners();
+      }
+
+      final List<PhotoSyncRecord> newRecords = [];
+      int processedAssets = 0;
 
       // 遍历所有相册
       for (final album in albums) {
+        if (processedAssets >= maxProcessFiles) {
+          print('已达到最大处理数量限制，停止扫描');
+          break;
+        }
+
         print('处理相册: ${album.name}');
 
         final assetCount = await album.assetCountAsync;
-        totalAssets += assetCount;
         print('相册 ${album.name} 包含 $assetCount 个文件');
 
         if (assetCount == 0) continue;
 
         // 分页获取资源，避免一次性加载过多
-        const pageSize = 100;
+        const pageSize = 50; // 减少页面大小以降低内存压力
         int page = 0;
+        int albumProcessedCount = 0;
 
         while (true) {
+          // 检查是否已达到总体限制
+          if (processedAssets >= maxProcessFiles) {
+            break;
+          }
+
           final List<AssetEntity> assets = await album.getAssetListPaged(
             page: page,
             size: pageSize,
@@ -189,66 +216,42 @@ class PhotoSyncService extends ChangeNotifier {
 
           print('处理第 ${page + 1} 页，${assets.length} 个文件');
 
-          for (final asset in assets) {
-            try {
-              // 检查资源是否存在
-              if (!await asset.exists) {
-                print('跳过已删除的资源: ${asset.id}');
-                continue;
-              }
+          // 分批处理资源以避免内存压力
+          const batchSize = 10;
+          for (int i = 0; i < assets.length; i += batchSize) {
+            if (processedAssets >= maxProcessFiles) break;
 
-              // 获取文件
-              final file = await asset.file;
-              if (file == null) {
-                print('无法获取文件: ${asset.id}');
-                continue;
-              }
+            final batch = assets.skip(i).take(batchSize).toList();
+            await _processAssetBatch(batch, newRecords);
 
-              if (!await file.exists()) {
-                print('文件不存在: ${file.path}');
-                continue;
-              }
+            processedAssets += batch.length;
+            albumProcessedCount += batch.length;
 
-              // 计算文件哈希
-              final fileHash = await _calculateFileHash(file);
+            // 更新进度
+            _processedFiles = processedAssets;
+            notifyListeners();
 
-              // 检查是否已存在
-              final existingRecord = await SyncDatabaseService.getByHash(
-                fileHash,
-              );
-              if (existingRecord != null) {
-                print('文件已存在记录，跳过: ${file.path}');
-                continue;
-              }
-
-              // 创建新的同步记录
-              final record = PhotoSyncRecord(
-                id: asset.id,
-                localPath: file.path,
-                fileName: path.basename(file.path),
-                fileHash: fileHash,
-                fileSize: await file.length(),
-                createdTime: asset.createDateTime,
-                modifiedTime: asset.modifiedDateTime,
-                remotePath: await _generateRemotePath(file.path),
-                status: SyncStatus.pending,
-              );
-
-              newRecords.add(record);
-              print('添加新记录: ${record.fileName}');
-            } catch (e) {
-              print('处理资源失败: ${asset.id}, 错误: $e');
+            // 定期释放内存
+            if (processedAssets % 100 == 0) {
+              await Future.delayed(
+                const Duration(milliseconds: 50),
+              ); // 短暂暂停释放内存
             }
           }
 
           page++;
 
           // 限制最大页数，避免无限循环
-          if (page > 1000) break;
+          if (page > 100) {
+            print('相册 ${album.name} 页数过多，跳过剩余部分');
+            break;
+          }
         }
+
+        print('相册 ${album.name} 处理完成，处理了 $albumProcessedCount 个文件');
       }
 
-      print('扫描完成，总计 $totalAssets 个文件，新增 ${newRecords.length} 个待同步文件');
+      print('扫描完成，总计处理 $processedAssets 个文件，新增 ${newRecords.length} 个待同步文件');
 
       // 批量插入新记录
       if (newRecords.isNotEmpty) {
@@ -257,10 +260,10 @@ class PhotoSyncService extends ChangeNotifier {
       }
 
       _totalFiles = newRecords.length;
-      _processedFiles = 0;
+      _processedFiles = processedAssets;
 
-      if (newRecords.isEmpty && totalAssets > 0) {
-        _errorMessage = '所有文件都已扫描过，没有新文件需要同步';
+      if (newRecords.isEmpty && processedAssets > 0) {
+        _errorMessage = '所有已扫描的文件都已存在记录，没有新文件需要同步';
       }
     } catch (e) {
       print('扫描相册失败: $e');
@@ -268,6 +271,87 @@ class PhotoSyncService extends ChangeNotifier {
     } finally {
       _isScanning = false;
       notifyListeners();
+    }
+  }
+
+  /// 分批处理资源
+  Future<void> _processAssetBatch(
+    List<AssetEntity> assets,
+    List<PhotoSyncRecord> newRecords,
+  ) async {
+    for (final asset in assets) {
+      try {
+        // 检查资源是否存在
+        if (!await asset.exists) {
+          print('跳过已删除的资源: ${asset.id}');
+          continue;
+        }
+
+        // 获取文件（添加超时和错误处理）
+        File? file;
+        try {
+          file = await asset.file?.timeout(
+            const Duration(seconds: 10),
+            onTimeout: () => null,
+          );
+        } catch (e) {
+          print('获取文件超时或失败: ${asset.id}, 错误: $e');
+          continue;
+        }
+
+        if (file == null) {
+          print('无法获取文件: ${asset.id}');
+          continue;
+        }
+
+        if (!await file.exists()) {
+          print('文件不存在: ${file.path}');
+          continue;
+        }
+
+        // 检查文件大小（跳过过大的文件以防止内存问题）
+        final fileStats = await file.stat();
+        const maxFileSize = 100 * 1024 * 1024; // 100MB 限制
+        if (fileStats.size > maxFileSize) {
+          print('文件过大，跳过: ${file.path} (${fileStats.size} bytes)');
+          continue;
+        }
+
+        // 计算文件哈希（添加错误处理）
+        String fileHash;
+        try {
+          fileHash = await _calculateFileHash(file);
+        } catch (e) {
+          print('计算文件哈希失败: ${file.path}, 错误: $e');
+          continue;
+        }
+
+        // 检查是否已存在
+        final existingRecord = await SyncDatabaseService.getByHash(fileHash);
+        if (existingRecord != null) {
+          print('文件已存在记录，跳过: ${file.path}');
+          continue;
+        }
+
+        // 创建新的同步记录
+        final record = PhotoSyncRecord(
+          id: asset.id,
+          localPath: file.path,
+          fileName: path.basename(file.path),
+          fileHash: fileHash,
+          fileSize: fileStats.size,
+          createdTime: asset.createDateTime,
+          modifiedTime: asset.modifiedDateTime,
+          remotePath: await _generateRemotePath(file.path),
+          status: SyncStatus.pending,
+        );
+
+        newRecords.add(record);
+        print('添加新记录: ${record.fileName}');
+      } catch (e) {
+        print('处理资源失败: ${asset.id}, 错误: $e');
+        // 继续处理下一个资源，不中断整个流程
+      }
     }
   }
 

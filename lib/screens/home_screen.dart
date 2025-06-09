@@ -10,6 +10,8 @@ import '../models/webdav_file.dart';
 import '../constants/app_constants.dart';
 import '../constants/app_theme.dart';
 import '../widgets/file_thumbnail.dart';
+import '../utils/file_utils.dart';
+import 'file_preview_screen.dart';
 
 /// 主页面（文件管理器）
 class HomeScreen extends StatefulWidget {
@@ -651,13 +653,52 @@ class _HomeScreenState extends State<HomeScreen> {
         );
       }
     } else {
-      _showFileOptions(file);
+      // 检查是否为可预览文件
+      if (FileUtils.isPreviewableFile(file)) {
+        _previewFile(file);
+      } else {
+        _showFileOptions(file);
+      }
     }
   }
 
   void _handleFileLongPress(file) {
-    final fileProvider = Provider.of<FileProvider>(context, listen: false);
-    fileProvider.selectFile(file.path);
+    // 长按显示操作菜单
+    if (!file.isDirectory) {
+      _showFileOptions(file);
+    } else {
+      // 对于文件夹，还是进入选择模式
+      final fileProvider = Provider.of<FileProvider>(context, listen: false);
+      fileProvider.selectFile(file.path);
+    }
+  }
+
+  /// 预览文件
+  void _previewFile(WebDavFile file) {
+    final authProvider = Provider.of<AuthProvider>(context, listen: false);
+
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => FilePreviewScreen(
+          file: file,
+          authHeader: authProvider.webDavService?.authHeader,
+          baseUrl: authProvider.webDavService?.baseUrl,
+          onDownload: () {
+            Navigator.pop(context);
+            _downloadFile(file);
+          },
+          onRename: () {
+            Navigator.pop(context);
+            _showRenameDialog(file);
+          },
+          onDelete: () {
+            Navigator.pop(context);
+            _confirmDelete(file);
+          },
+        ),
+      ),
+    );
   }
 
   Future<void> _refreshDirectory() async {
